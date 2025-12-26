@@ -22,11 +22,19 @@ export default function RoomPage() {
   const producerTransportRef = useRef(null);
   const consumerTransportsRef = useRef([]);
   const localStreamRef = useRef(null);
+  const videoProducerRef = useRef(null); 
+  const audioProducerRef = useRef(null); 
+
+  const remoteStreamsRef = useRef({});
 
   const joinRoom = async () => {
     if (!roomName) return;
     setJoined(true);
 
+    // const socket = io("http://192.168.98.174:4000", {
+    //   path: "/mediasoup",
+    //   transports: ["websocket"],
+    // });
     const socket = io("http://localhost:4000", {
       path: "/mediasoup",
       transports: ["websocket"],
@@ -36,19 +44,25 @@ export default function RoomPage() {
     socket.on("connect", async () => {
       console.log("✅ Connected:", socket.id);
 
-      socket.emit("joinRoom", { roomName }, async ({ rtpCapabilities, existingProducers }) => {
-        const device = new mediasoupClient.Device();
-        await device.load({ routerRtpCapabilities: rtpCapabilities });
-        deviceRef.current = device;
+      socket.emit("joinRoom", { roomName }, async ({ rtpCapabilities, otherPeersData }) => {
+        try {
+          const device = new mediasoupClient.Device();
+          await device.load({ routerRtpCapabilities: rtpCapabilities });
+          deviceRef.current = device;
 
-        await getLocalStream();
-        createSendTransport();
-
-        if (existingProducers?.length > 0) {
-          for (const producerId of existingProducers) {
-            console.log("📡 Consuming existing producer:", producerId);
-            await consumeStream(producerId);
+          await getLocalStream();
+          createSendTransport();
+          
+          if (otherPeersData?.length > 0) {
+            for (const peerData of otherPeersData) {
+              for (const producerId of peerData.producerIds) {
+                console.log(`📡 Consuming existing producer: ${producerId} from peer: ${peerData.peerId}`);
+                await consumeStream(producerId, peerData.peerId);
+              }
+            }
           }
+        } catch (err) {
+            console.error("❌ Error in joinRoom callback:", err);
         }
       });
     });
@@ -61,8 +75,22 @@ export default function RoomPage() {
         });
         localStreamRef.current = stream;
         if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+        
+        // --- NEW: Check if tracks were actually acquired ---
+        if (!stream.getAudioTracks().length) {
+            console.warn("⚠️ No audio track found. Mic might be disabled or unavailable.");
+            alert("Could not find a microphone. You will be muted.");
+            setMicOn(false);
+        }
+        if (!stream.getVideoTracks().length) {
+            console.warn("⚠️ No video track found. Camera might be disabled or unavailable.");
+            alert("Could not find a camera. Your video will be off.");
+            setVideoOn(false);
+        }
+
       } catch (err) {
         console.error("❌ Error accessing media devices:", err);
+        alert("Error accessing media devices. Please check permissions.");
       }
     }
 
@@ -77,20 +105,46 @@ export default function RoomPage() {
         const producerTransport = device.createSendTransport(params);
         producerTransportRef.current = producerTransport;
 
-        producerTransport.on("connect", ({ dtlsParameters }, callback) => {
-          socket.emit("transport-connect", {
-            dtlsParameters,
-            transportId: producerTransport.id,
-          });
-          callback();
+        producerTransport.on("connect", ({ dtlsParameters }, callback, errback) => {
+          // --- NEW: Added errback ---
+          try {
+            socket.emit("transport-connect", {
+              dtlsParameters,
+              transportId: producerTransport.id,
+            });
+            callback();
+          } catch (err) {
+            errback(err);
+          }
         });
 
-        producerTransport.on("produce", async ({ kind, rtpParameters }, callback) => {
-          socket.emit(
-            "transport-produce",
-            { kind, rtpParameters, transportId: producerTransport.id },
-            ({ id }) => callback({ id })
-          );
+        producerTransport.on("produce", async ({ kind, rtpParameters, appData }, callback, errback) => {
+            // --- NEW: Added errback and try...catch ---
+          try {
+            socket.emit(
+              "transport-produce",
+              { kind, rtpParameters, transportId: producerTransport.id },
+              ({ id, error }) => {
+                if (error) {
+                  console.error("❌ Error producing:", error);
+                  errback(new Error(error));
+                  return;
+                }
+                callback({ id });
+              }
+            );
+          } catch (err) {
+            errback(err);
+          }
+        });
+
+        // --- NEW: 'connectionstatechange' listener for debugging ---
+        producerTransport.on("connectionstatechange", (state) => {
+            console.log(`⬆️ Producer transport state: ${state}`);
+            if (state === 'failed') {
+                console.error('Producer transport connection failed');
+                producerTransport.close();
+            }
         });
 
         await startStream(producerTransport);
@@ -105,25 +159,72 @@ export default function RoomPage() {
       const audioTrack = stream.getAudioTracks()[0];
 
       try {
-        if (videoTrack) await producerTransport.produce({ track: videoTrack });
-        if (audioTrack) await producerTransport.produce({ track: audioTrack });
+        // --- MODIFIED: Store producers to manage them later (e.g., mute/unmute) ---
+        if (videoTrack) {
+          videoProducerRef.current = await producerTransport.produce({ 
+              track: videoTrack,
+              encodings: [ // --- NEW: Example of specifying encodings (optional but good)
+                  { maxBitrate: 100000 },
+                  { maxBitrate: 300000 },
+                  { maxBitrate: 900000 },
+              ],
+              codecOptions: {
+                  videoGoogleStartBitrate: 1000
+              }
+            });
+        }
+        if (audioTrack) {
+          audioProducerRef.current = await producerTransport.produce({ track: audioTrack });
+        }
         console.log("🎥 Local media published successfully");
       } catch (err) {
         console.error("❌ Error producing stream:", err);
       }
     }
 
-    socket.on("newProducer", async ({ producerId }) => {
-      console.log("🆕 New producer detected:", producerId);
-      await consumeStream(producerId);
+    // --- MODIFIED: Now receives peerId ---
+    socket.on("newProducer", async ({ producerId, peerId }) => {
+      console.log(`🆕 New producer detected: ${producerId} from peer: ${peerId}`);
+      await consumeStream(producerId, peerId);
     });
 
-    async function consumeStream(remoteProducerId) {
+    // --- NEW: Listen for peers closing ---
+    socket.on("peerClosed", ({ peerId }) => {
+        console.log(`❌ Peer closed: ${peerId}`);
+        const remoteData = remoteStreamsRef.current[peerId];
+        if (remoteData) {
+            // Stop tracks and remove video element
+            remoteData.videoEl.srcObject = null; // Detach stream
+            remoteData.videoEl.remove();
+            remoteData.stream.getTracks().forEach(t => t.stop());
+
+            // Close associated consumer transports
+            remoteData.consumers.forEach(consumer => {
+                const transport = consumerTransportsRef.current.find(
+                    t => t.consumer.id === consumer.id
+                );
+                if (transport) {
+                    transport.consumerTransport.close();
+                }
+            });
+
+            // Clean up refs
+            consumerTransportsRef.current = consumerTransportsRef.current.filter(
+                t => !remoteData.consumers.find(c => c.id === t.consumer.id)
+            );
+            delete remoteStreamsRef.current[peerId];
+        }
+    });
+
+    // --- COMPLETELY REWRITTEN FUNCTION ---
+    async function consumeStream(remoteProducerId, peerId) {
       if (!deviceRef.current) {
         console.error("Device not initialized");
         return;
       }
 
+      // Create a new consumer transport if needed, or reuse an existing one
+      // For simplicity here, we create one per consumer, but reuse is possible.
       socket.emit("createWebRtcTransport", { consumer: true }, async ({ params }) => {
         if (params.error) {
           console.error("❌ Consumer transport creation error:", params.error);
@@ -131,13 +232,26 @@ export default function RoomPage() {
         }
 
         const consumerTransport = deviceRef.current.createRecvTransport(params);
+        
+        consumerTransport.on("connect", ({ dtlsParameters }, callback, errback) => {
+          try {
+            socket.emit("transport-recv-connect", {
+              dtlsParameters,
+              transportId: consumerTransport.id,
+            });
+            callback();
+          } catch (err) {
+            errback(err);
+          }
+        });
 
-        consumerTransport.on("connect", ({ dtlsParameters }, callback) => {
-          socket.emit("transport-recv-connect", {
-            dtlsParameters,
-            transportId: consumerTransport.id,
-          });
-          callback();
+        // --- NEW: 'connectionstatechange' listener for debugging ---
+        consumerTransport.on("connectionstatechange", (state) => {
+            console.log(`⬇️ Consumer transport (${peerId}) state: ${state}`);
+             if (state === 'failed') {
+                console.error(`Consumer transport (${peerId}) connection failed`);
+                consumerTransport.close();
+            }
         });
 
         socket.emit(
@@ -153,38 +267,61 @@ export default function RoomPage() {
               return;
             }
 
-            const consumer = await consumerTransport.consume({
-              id: consumeParams.id,
-              producerId: consumeParams.producerId,
-              kind: consumeParams.kind,
-              rtpParameters: consumeParams.rtpParameters,
-            });
+            try {
+              const consumer = await consumerTransport.consume({
+                id: consumeParams.id,
+                producerId: consumeParams.producerId,
+                kind: consumeParams.kind,
+                rtpParameters: consumeParams.rtpParameters,
+              });
 
-            const stream = new MediaStream([consumer.track]);
-            consumerTransportsRef.current.push({ consumerTransport, consumer });
+              // --- NEW: Logic to combine tracks into one stream per peer ---
+              let remoteData = remoteStreamsRef.current[peerId];
+              
+              // If this is the first track from this peer, create stream and video element
+              if (!remoteData) {
+                  const stream = new MediaStream();
+                  const video = document.createElement("video");
+                  video.srcObject = stream;
+                  video.autoplay = true;
+                  video.playsInline = true;
+                  video.className = "rounded-xl shadow-lg w-72 h-48 object-cover bg-black";
+                  remoteContainerRef.current?.appendChild(video);
+                  
+                  remoteData = { stream, videoEl: video, consumers: [] };
+                  remoteStreamsRef.current[peerId] = remoteData;
+              }
 
-            if (consumer.kind === "video") {
-              const video = document.createElement("video");
-              video.srcObject = stream;
-              video.autoplay = true;
-              video.playsInline = true;
-              video.className =
-                "rounded-xl shadow-lg w-72 h-48 object-cover bg-black";
-              remoteContainerRef.current?.appendChild(video);
-            } else if (consumer.kind === "audio") {
-              const audio = document.createElement("audio");
-              audio.srcObject = stream;
-              audio.autoplay = true;
-              audio.controls = false;
-              audio.addEventListener("canplay", () =>
-                audio
-                  .play()
-                  .catch((err) => console.warn("🔇 Autoplay blocked:", err))
-              );
-              remoteContainerRef.current?.appendChild(audio);
+              // Add the new track to the existing stream
+              remoteData.stream.addTrack(consumer.track);
+              remoteData.consumers.push(consumer);
+              
+              // Store transport for cleanup
+              consumerTransportsRef.current.push({ consumerTransport, consumer });
+
+              // --- NEW: Handle track ending (e.g., user stops camera) ---
+              consumer.on("trackended", () => {
+                  console.log(`Track ended for consumer: ${consumer.id}`);
+                  // Remove track from stream (optional, but good practice)
+                  remoteData.stream.removeTrack(consumer.track);
+              });
+
+              // --- NEW: Handle producer pausing (e.g., user mutes) ---
+              consumer.on("producerpause", () => {
+                  console.log(`Producer paused for consumer: ${consumer.id}`);
+                  // You could show a "muted" icon on the video element
+              });
+              consumer.on("producerresume", () => {
+                  console.log(`Producer resumed for consumer: ${consumer.id}`);
+                  // You could hide the "muted" icon
+              });
+
+              // Resume the consumer on the server
+              socket.emit("consumer-resume", { consumerId: consumer.id });
+
+            } catch (err) {
+                console.error("❌ Error in consumerTransport.consume:", err);
             }
-
-            socket.emit("consumer-resume", { consumerId: consumer.id });
           }
         );
       });
@@ -196,29 +333,38 @@ export default function RoomPage() {
       producerTransportRef.current?.close();
       consumerTransportsRef.current.forEach((t) => t.consumerTransport.close());
       socket.disconnect();
+      
+      // Clear remote streams
+      for (const peerId in remoteStreamsRef.current) {
+          const remoteData = remoteStreamsRef.current[peerId];
+          remoteData.videoEl.remove();
+      }
+      remoteStreamsRef.current = {};
     };
   };
 
-  // --- Mic and Video Toggles ---
   const toggleMic = () => {
-    const stream = localStreamRef.current;
-    if (!stream) return;
-    const audioTrack = stream.getAudioTracks()[0];
-    if (audioTrack) {
-      audioTrack.enabled = !audioTrack.enabled;
-      setMicOn(audioTrack.enabled);
+    if (!audioProducerRef.current) return;
+    const newMicOn = !micOn;
+    if (newMicOn) {
+        audioProducerRef.current.resume();
+    } else {
+        audioProducerRef.current.pause();
     }
+    setMicOn(newMicOn);
   };
 
   const toggleVideo = () => {
-    const stream = localStreamRef.current;
-    if (!stream) return;
-    const videoTrack = stream.getVideoTracks()[0];
-    if (videoTrack) {
-      videoTrack.enabled = !videoTrack.enabled;
-      setVideoOn(videoTrack.enabled);
+    if (!videoProducerRef.current) return;
+    const newVideoOn = !videoOn;
+     if (newVideoOn) {
+        videoProducerRef.current.resume();
+    } else {
+        videoProducerRef.current.pause();
     }
+    setVideoOn(newVideoOn);
   };
+  
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-950 text-white">
@@ -250,7 +396,7 @@ export default function RoomPage() {
               <video
                 ref={localVideoRef}
                 autoPlay
-                muted
+                muted // Mute local video to prevent echo
                 playsInline
                 className="rounded-xl shadow-lg w-80 h-52 object-cover bg-black"
               ></video>
